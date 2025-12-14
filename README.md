@@ -1,53 +1,106 @@
-# libnvidia-hide (LD_PRELOAD workaround for Electron dGPU wakeups)
+# libnvidia-hide
+**Prevent Electron apps from waking NVIDIA dGPU on hybrid laptops (LD_PRELOAD)**
+
+---
 
 ## What this is
 
-This project provides a **small `LD_PRELOAD` shared library** that prevents Electron / Chromium-based applications (VS Code, Slack, Discord, etc.) from **waking up an NVIDIA dGPU** on hybrid graphics laptops.
+`libnvidia-hide` is a **small LD_PRELOAD shared library** that prevents Electron / Chromium-based applications (VS Code, Slack, Discord, etc.) from **waking up an NVIDIA dGPU** on hybrid graphics systems.
 
-### The problem
+It does this entirely in **userspace**, without sandboxing, cgroups, udev rules, driver removal, or permission hacks.  
+Applications keep full access to files, microphone, camera, portals, etc., while transparently falling back to the iGPU.
 
-On hybrid GPU systems (Intel/AMD iGPU + NVIDIA dGPU), Electron apps often:
+---
 
-- enumerate **all DRM render nodes** (`/dev/dri/renderD*`)
+## The problem
+
+On modern hybrid GPU laptops, Electron applications frequently:
+
+- enumerate **all DRM devices** (`/dev/dri/card*`, `renderD*`)
 - load **NVIDIA GBM / GLX / Vulkan libraries**
-- probe **NVIDIA Vulkan ICDs and implicit layers**
+- parse **NVIDIA Vulkan ICDs and implicit layers**
+- probe **PCI configuration space** for GPUs
 - open `/dev/nvidia*` character devices
 
-Even *probing* these resources is enough to **runtime-resume the dGPU**, causing:
+Any of the above is enough to **runtime-resume the NVIDIA GPU**, causing:
+
 - unnecessary power usage
 - slow application startup
 - possibly broken power management
 
-Environment variables alone (`DRI_PRIME=0`, `__GLX_VENDOR_LIBRARY_NAME=mesa`, Vulkan overrides, etc.) are **not sufficient** in many cases.
+Environment variables such as:
 
-### What this project does
+- `DRI_PRIME=0`
+- `__GLX_VENDOR_LIBRARY_NAME=mesa`
+- Vulkan loader overrides
 
-This library **intercepts key libc functions at runtime** and:
+are **not sufficient** in many real-world cases.
 
-1. **Hides NVIDIA devices from enumeration**
-   - Filters out NVIDIA entries from `readdir()` / `readdir64()`
-   - Electron never “sees” the NVIDIA render node
+---
 
-2. **Blocks opening NVIDIA device nodes**
-   - `/dev/dri/renderD*` (NVIDIA)
-   - `/dev/nvidia*`
+## What this project does
 
-3. **Blocks loading NVIDIA userspace libraries**
-   - `libGLX_nvidia.so`
-   - `nvidia-drm_gbm.so`
-   - `libnvidia-*`
+`libnvidia-hide` prevents NVIDIA from being considered **at discovery time**, not just at usage time.
 
-4. **Prevents Vulkan from discovering NVIDIA**
-   - Blocks NVIDIA Vulkan ICDs and implicit layers
+Specifically, it:
 
-Crucially, this is done **without**:
-- sandboxing
-- permission/group changes
-- udev rules
-- disabling the NVIDIA driver
-- breaking file/mic/camera access for applications that need it (such as MS Teams)
+### 1. Dynamically discovers NVIDIA devices
+(Since v2, without hardcoded card numbers)
 
-The application simply **falls back to the Intel iGPU**, and the dGPU stays suspended.
+- Scans `/sys/class/drm/*/vendor` to find NVIDIA DRM nodes
+- Resolves the corresponding PCI BDFs via sysfs
+- **In theory**, it should work regardless of enumeration order or node numbering
+
+### 2. Hides NVIDIA from filesystem enumeration
+
+- Filters NVIDIA entries from:
+  - `/dev`
+  - `/dev/dri`
+  - `/dev/dri/by-path`
+- Electron never “sees” NVIDIA nodes during probing
+
+### 3. Blocks NVIDIA device access
+
+- Denies opens of:
+  - `/dev/dri/renderD*` (NVIDIA only)
+  - `/dev/nvidia*`
+
+### 4. Blocks NVIDIA userspace stacks
+
+- Prevents loading of:
+  - `nvidia-drm_gbm.so`
+  - `libGLX_nvidia.so`
+  - `libnvidia-*`
+- Stops Chromium/Electron from selecting NVIDIA paths early
+
+### 5. Prevents PCI-level probing
+
+- Blocks reads of:
+  - `/sys/.../<NVIDIA_BDF>/config`
+- This avoids runtime PM resume even when `/dev/nvidia*` is blocked
+
+### 6. Works with Electron’s multi-process model
+
+- Each Electron subprocess loads the library
+- Initialization happens once per process (expected and correct)
+
+---
+
+## What this project deliberately does *not* do
+
+- No sandboxing
+- No cgroup device filtering
+- No group / permission changes
+- No driver blacklisting
+- No kernel patches
+- No system-wide effects unless explicitly preloaded
+
+---
+
+## Limitations
+
+- **Does not work with Flatpak / Snap apps**
+  - LD_PRELOAD is blocked by design in sandboxed environments
 
 ---
 
@@ -58,107 +111,101 @@ This repo already contains a pre-compiled library for you to use directly. If yo
 ### Requirements
 
 - `gcc`
-- `glibc`
-- `libdl` (part of glibc)
+- `glibc` (libdl is part of glibc)
 
 ### Build steps
 
 ```bash
-mkdir -p ~/.local/lib
 gcc -shared -fPIC -O2 -ldl -o libnvidia-hide.so libnvidia-hide.c
 ```
 
-This produces:
+Recommended location:
 
+```bash
+mkdir -p ~/.local/lib
+mv libnvidia-hide.so ~/.local/lib/
 ```
-libnvidia-hide.so
-```
-
-You can place it anywhere, but `~/.local/lib/` is recommended.
 
 ---
 
-## OPTIONAL: Customizing / identifying GPU device paths
+## How to use
 
-Different systems may have different render node numbers.
-Before modifying the code, **identify what your Electron app actually touches**.
-
-### Step 1: Trace GPU-related syscalls
+### One-off (per launch)
 
 ```bash
-LD_PRELOAD=./libnvidia-hide.so \
-strace -f -e openat,openat2,ioctl \
--o /tmp/electron.trace \
-slack
+LD_PRELOAD=$HOME/.local/lib/libnvidia-hide.so code
 ```
 
-(Replace `slack` with `discord`, `code`, etc., depending on your use case)
-
-### Step 2: Inspect GPU-related accesses
-
-```bash
-grep -E "renderD[0-9]+|/dev/nvidia|nvidia-drm_gbm|libGLX_nvidia|nvidia_icd|nvidia_layers" \
-/tmp/electron.trace | head -n 120
-```
-
-Typical output before fixing might include:
-
-```
-openat(..., "/dev/dri/renderD129", ...)
-openat(..., "/dev/nvidia0", ...)
-openat(..., "/usr/lib/gbm/nvidia-drm_gbm.so", ...)
-openat(..., "/usr/share/vulkan/icd.d/nvidia_icd.json", ...)
-```
-
-### Step 3: Adjust the code if needed
-
-In `libnvidia-hide.c`, look for:
-
-```c
-if (!strcmp(p, "/dev/dri/renderD129")) return 1;
-```
-
-If, for example, your NVIDIA render node is different (e.g. `renderD130`), update it accordingly.
-
----
-
-## How to use it
-
-### A) One-off usage (per app)
-
-```bash
-LD_PRELOAD=/full/path/to/libnvidia-hide.so discord
-```
-
-### B) Wrapper script (recommended)
+### Wrapper script (recommended)
 
 ```bash
 mkdir -p ~/.local/bin
 
-cat > ~/.local/bin/slack <<'EOF'
+cat > ~/.local/bin/code <<'EOF'
 #!/usr/bin/env bash
 export LD_PRELOAD="$HOME/.local/lib/libnvidia-hide.so${LD_PRELOAD:+:$LD_PRELOAD}"
-exec /usr/bin/slack "$@"
+exec /usr/bin/code "$@"
 EOF
 
-chmod +x ~/.local/bin/slack
+chmod +x ~/.local/bin/code
 ```
 
-### C) Desktop entry (GUI launchers)
+Ensure `~/.local/bin` comes before `/usr/bin` in `$PATH`.
+
+### Desktop entry
 
 ```ini
-Exec=env LD_PRELOAD=/full/path/to/libnvidia-hide.so slack %U
+Exec=env LD_PRELOAD=/home/USER/.local/lib/libnvidia-hide.so code %U
 ```
 
 ---
 
-## Scope and limitations
+## Debugging
 
--  **Tested and confirmed working with some popular Electron apps**
--  **Not yet tested with non-Electron applications** (though may work similarly)
--  May need adjustment if render node numbers or PCI layout differ
+Enable debug output:
+
+```bash
+LIBNVIDIAHIDE_DEBUG=1 LD_PRELOAD=./libnvidia-hide.so code
+```
+
+Expected output (example):
+
+```
+[libnvidia-hide] init: nvidia_nodes=2 nvidia_bdfs=1
+[libnvidia-hide]   node: card1
+[libnvidia-hide]   node: renderD129
+[libnvidia-hide]   bdf:  0000:01:00.0
+```
+
+Repeated output is normal as Electron spawns multiple processes.
 
 ---
+
+## Verifying that the dGPU stays asleep
+
+### Runtime PM status
+
+```bash
+watch -n0.5 cat /sys/bus/pci/devices/0000:01:00.0/power/runtime_status
+```
+- Here, `0000:01:00.0` is used as an example (NVIDIA card on my machine).
+
+Should remain:
+
+```
+suspended
+```
+
+### Audit / tracing
+
+```bash
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_openat
+/str(args->filename) ~ "nvidia|renderD"/
+{ printf("%s %d %s\n", comm, pid, str(args->filename)); }'
+```
+
+With `libnvidia-hide` active, no NVIDIA opens should appear.
 
 ## Final notes
 
