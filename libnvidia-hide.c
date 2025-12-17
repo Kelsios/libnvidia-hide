@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <limits.h>
 #include <linux/limits.h>
 #include <sched.h>
@@ -14,6 +15,20 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+static void dbg(const char *fmt, ...);
+static void trim(char *s);
+
+
+static void trim(char *s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    while (n && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = 0;
+    size_t i = 0;
+    while (s[i] == ' ' || s[i] == '\t') i++;
+    if (i) memmove(s, s+i, strlen(s+i)+1);
+}
+
 
 #if __has_include(<linux/openat2.h>)
 #include <linux/openat2.h>
@@ -32,6 +47,130 @@ static volatile int g_initializing = 0;
 
 // --------- detected NVIDIA DRM nodes ---------
 // store basenames like "card1", "renderD129"
+// --------- policy (allow/deny) ----------
+// If allowlist is non-empty, the library is active only when /proc/self/exe matches.
+// If denylist matches, the library is disabled for that process.
+static int g_active = 1;
+
+
+static const char *base_name(const char *p) {
+    if (!p) return p;
+    const char *s = strrchr(p, '/');
+    return s ? s+1 : p;
+}
+
+static int read_self_exe(char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return -1;
+    ssize_t n = readlink("/proc/self/exe", out, out_sz - 1);
+    if (n < 0) return -1;
+    out[n] = 0;
+    return 0;
+}
+
+// Match a single pattern against either full exe path (if pattern has '/')
+// or basename (if pattern has no '/').
+static int match_pat(const char *pat, const char *exe_full, const char *exe_base) {
+    if (!pat || !*pat) return 0;
+    const char *target = (strchr(pat, '/') != NULL) ? exe_full : exe_base;
+    if (!target) return 0;
+    // FNM_PATHNAME would make '*' not cross '/', but we want typical shell-glob semantics.
+    return fnmatch(pat, target, 0) == 0;
+}
+
+// Env list is colon-separated patterns.
+static int env_list_has_match(const char *envval, const char *exe_full, const char *exe_base) {
+    if (!envval || !*envval) return 0;
+    const char *p = envval;
+    while (*p) {
+        const char *q = strchr(p, ':');
+        size_t len = q ? (size_t)(q - p) : strlen(p);
+        if (len) {
+            char buf[PATH_MAX];
+            if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+            memcpy(buf, p, len);
+            buf[len] = 0;
+            trim(buf);
+            if (match_pat(buf, exe_full, exe_base)) return 1;
+        }
+        if (!q) break;
+        p = q + 1;
+    }
+    return 0;
+}
+
+static int file_list_has_match(const char *path, const char *exe_full, const char *exe_base, int *out_had_entries) {
+    if (out_had_entries) *out_had_entries = 0;
+    if (!path || !*path) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[PATH_MAX];
+    while (fgets(line, sizeof(line), f)) {
+        trim(line);
+        if (!line[0] || line[0] == '#') continue;
+        if (out_had_entries) *out_had_entries = 1;
+        if (match_pat(line, exe_full, exe_base)) {
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+static void build_xdg_path(char *out, size_t out_sz, const char *leaf) {
+    if (!out || out_sz == 0) return;
+    out[0] = 0;
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    if (xdg && *xdg) {
+        snprintf(out, out_sz, "%s/nvidia-hide/%s", xdg, leaf);
+    } else if (home && *home) {
+        snprintf(out, out_sz, "%s/.config/nvidia-hide/%s", home, leaf);
+    } else {
+        snprintf(out, out_sz, "/nonexistent/%s", leaf);
+    }
+}
+
+static void apply_policy_from_exe(void) {
+    char exe_full[PATH_MAX];
+    if (read_self_exe(exe_full, sizeof(exe_full)) < 0) {
+        // If we cannot read /proc/self/exe, keep active (fail open).
+        return;
+    }
+    const char *exe_base = base_name(exe_full);
+
+    const char *env_allow = getenv("LIBNVIDIAHIDE_ALLOWLIST");
+    const char *env_deny  = getenv("LIBNVIDIAHIDE_DENYLIST");
+
+    char allow_path[PATH_MAX], deny_path[PATH_MAX];
+    build_xdg_path(allow_path, sizeof(allow_path), "allowlist");
+    build_xdg_path(deny_path, sizeof(deny_path), "denylist");
+
+    int file_allow_had = 0;
+    int file_deny_had  = 0;
+
+    int allow_match_env = env_list_has_match(env_allow, exe_full, exe_base);
+    int deny_match_env  = env_list_has_match(env_deny,  exe_full, exe_base);
+
+    int allow_match_file = file_list_has_match(allow_path, exe_full, exe_base, &file_allow_had);
+    int deny_match_file  = file_list_has_match(deny_path,  exe_full, exe_base, &file_deny_had);
+
+    int has_allow = (env_allow && *env_allow) || file_allow_had;
+    int allow_match = allow_match_env || allow_match_file;
+
+    // If allowlist exists and we don't match it => disable.
+    if (has_allow && !allow_match) g_active = 0;
+
+    // Denylist always wins if matched.
+    if (deny_match_env || deny_match_file) g_active = 0;
+
+    if (g_debug) {
+        dbg("policy: exe=%s", exe_full);
+        dbg("policy: active=%d (has_allow=%d allow_match=%d deny_match=%d)",
+            g_active, has_allow, allow_match, (deny_match_env || deny_match_file));
+    }
+}
+
 #define MAX_NODES 64
 static char g_nodes[MAX_NODES][NAME_MAX];
 static int  g_nodes_n = 0;
@@ -60,11 +199,6 @@ static void dbg(const char *fmt, ...) {
     va_end(ap);
 }
 
-static void trim(char *s) {
-    if (!s) return;
-    size_t n = strlen(s);
-    while (n && (s[n-1]=='\n' || s[n-1]=='\r' || s[n-1]==' ' || s[n-1]=='\t')) s[--n]=0;
-}
 
 static int read_file_raw(const char *path, char *buf, size_t bufsz) {
     int fd = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0);
@@ -169,6 +303,20 @@ static void nh_init(void) {
         const char *dbg_env = getenv("LIBNVIDIAHIDE_DEBUG");
     if (dbg_env && strcmp(dbg_env, "0") != 0) g_debug = 1;
 
+    g_active = 1;
+    apply_policy_from_exe();
+
+
+    if (!g_active) {
+        if (g_debug) dbg("init: inactive for this process; skipping discovery/hooks");
+        return;
+    }
+    if (!g_active) {
+        if (g_debug) dbg("init: inactive for this process; skipping discovery");
+        return;
+    }
+
+
     scan_nodes_raw();
     discover_bdfs_from_nodes();
 
@@ -185,6 +333,7 @@ static inline void ensure_init(void) { if (!__atomic_load_n(&g_inited, __ATOMIC_
 // ---------- deny logic ----------
 
 static int is_nvidia_path(const char *p) {
+    if (!g_active) return 0;
     if (!p) return 0;
     ensure_init();
 
@@ -219,6 +368,7 @@ static int is_nvidia_path(const char *p) {
 }
 
 static int is_nvidia_dirent(DIR *dirp, const char *name) {
+    if (!g_active) return 0;
     if (!name) return 0;
     ensure_init();
 
