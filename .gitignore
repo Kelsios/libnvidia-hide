@@ -1,5 +1,5 @@
 # Build artifacts
-nvidia-hide
-libnvidia-hide.so
+/nvidia-hide
+/libnvidia-hide.so
 target/
 Cargo.lock
