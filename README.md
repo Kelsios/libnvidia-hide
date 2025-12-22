@@ -2,7 +2,7 @@
 
 This branch contains the **Rust port** of the C implementation from the other branch in the same repo.
 
-This README intentionally **does not** re-explain what the project is or how the hiding logic works — see the C branch README for the full overview. This file only documents what’s *different* in the Rust port and how to build it.
+**See the C branch README for the full overview**.
 
 ---
 
