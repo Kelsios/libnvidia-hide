@@ -132,7 +132,7 @@ This repository from now on ships **source only**. You are expected to build loc
 ### Build commands
 
 ```bash
-gcc -O2 -fPIC -Wall -Wextra -std=c11 \
+gcc -O2 -fPIC -Wall -Wextra -std=c11 -pthread \
   -shared -ldl \
   -o libnvidia-hide.so libnvidia-hide.c
 

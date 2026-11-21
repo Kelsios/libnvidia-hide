@@ -6,7 +6,7 @@
 #include <fnmatch.h>
 #include <limits.h>
 #include <linux/limits.h>
-#include <sched.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -42,8 +42,7 @@ struct open_how { uint64_t flags, mode, resolve; };
 static int g_debug = 0;
 
 // --------- init guards ---------
-static volatile int g_inited = 0;
-static volatile int g_initializing = 0;
+static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 
 // --------- detected NVIDIA DRM nodes ---------
 // store basenames like "card1", "renderD129"
@@ -291,31 +290,14 @@ static void discover_bdfs_from_nodes(void) {
 }
 
 static void nh_init(void) {
-    if (__atomic_load_n(&g_inited, __ATOMIC_ACQUIRE)) return;
-
-    int expected = 0;
-    if (!__atomic_compare_exchange_n(&g_initializing, &expected, 1, 0,
-        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-        while (!__atomic_load_n(&g_inited, __ATOMIC_ACQUIRE)) sched_yield();
-        return;
-        }
-
-        const char *dbg_env = getenv("LIBNVIDIAHIDE_DEBUG");
+    const char *dbg_env = getenv("LIBNVIDIAHIDE_DEBUG");
     if (dbg_env && strcmp(dbg_env, "0") != 0) g_debug = 1;
 
-    g_active = 1;
     apply_policy_from_exe();
-
-
     if (!g_active) {
-        if (g_debug) dbg("init: inactive for this process; skipping discovery/hooks");
+        dbg("init: inactive for this process; skipping discovery");
         return;
     }
-    if (!g_active) {
-        if (g_debug) dbg("init: inactive for this process; skipping discovery");
-        return;
-    }
-
 
     scan_nodes_raw();
     discover_bdfs_from_nodes();
@@ -323,19 +305,16 @@ static void nh_init(void) {
     dbg("init: nvidia_nodes=%d nvidia_bdfs=%d", g_nodes_n, g_bdfs_n);
     for (int i=0;i<g_nodes_n;i++) dbg("  node: %s", g_nodes[i]);
     for (int i=0;i<g_bdfs_n;i++) dbg("  bdf:  %s", g_bdfs[i]);
-
-    __atomic_store_n(&g_inited, 1, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_initializing, 0, __ATOMIC_RELEASE);
 }
 
-static inline void ensure_init(void) { if (!__atomic_load_n(&g_inited, __ATOMIC_ACQUIRE)) nh_init(); }
+static inline void ensure_init(void) { pthread_once(&g_init_once, nh_init); }
 
 // ---------- deny logic ----------
 
 static int is_nvidia_path(const char *p) {
-    if (!g_active) return 0;
     if (!p) return 0;
     ensure_init();
+    if (!g_active) return 0;
 
     // Device nodes
     if (!strncmp(p, "/dev/nvidia", 10)) return 1;
@@ -368,9 +347,9 @@ static int is_nvidia_path(const char *p) {
 }
 
 static int is_nvidia_dirent(DIR *dirp, const char *name) {
-    if (!g_active) return 0;
     if (!name) return 0;
     ensure_init();
+    if (!g_active) return 0;
 
     // If it scans /dev, hide /dev/nvidia* names
     if (!strncmp(name, "nvidia", 5)) return 1;

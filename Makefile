@@ -6,7 +6,7 @@ PREFIX ?= /usr/local
 all: libnvidia-hide.so nvidia-hide
 
 libnvidia-hide.so: libnvidia-hide.c
-	$(CC) $(CFLAGS) $(LDFLAGS_SO) -o $@ $<
+	$(CC) $(CFLAGS) -pthread $(LDFLAGS_SO) -o $@ $<
 
 nvidia-hide: nvidia-hide.c
 	$(CC) -O2 -Wall -Wextra -std=c11 -o $@ $<
